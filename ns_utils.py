@@ -2,7 +2,7 @@
 ns_utils.py — shared utilities for NetSuite extract scripts.
 
 Covers: logging, config loading, ODBC connections, DuckDB loading,
-plant/manufacturer resolution, business-day math, and timing helpers.
+comma-separated ID resolution, manufacturer classification, business-day math, and timing helpers.
 
 Usage in a script:
     from ns_utils import log_setup, load_config, sql_to_df, connect_netsuite, load_duckdb, format_elapsed
@@ -130,7 +130,7 @@ def sql_to_df(conn, query):
 # DUCKDB
 # ==============================================================
 
-def load_duckdb(db_path, table_name, df):
+def load_duckdb(db_path, table_name, df, log=None):
     """
     Drop-and-recreate a DuckDB table from a DataFrame, return row count.
 
@@ -144,6 +144,8 @@ def load_duckdb(db_path, table_name, df):
     table_name : str
         Fully qualified name, e.g. "raw.sd_ontime_raw".
     df : pd.DataFrame
+    log : callable, optional
+        log(msg) from log_setup(). If provided, schema creation is logged.
 
     Returns
     -------
@@ -152,10 +154,22 @@ def load_duckdb(db_path, table_name, df):
 
     Example
     -------
-        count = load_duckdb(config["db_path"], config["table_name"], df)
+        count = load_duckdb(config["db_path"], config["table_name"], df, log=log)
         print(f"Rows loaded: {count}")
     """
     conn = duckdb.connect(str(db_path))
+    if "." in table_name:
+        schema = table_name.split(".")[0]
+        exists = conn.execute(
+            "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = ?",
+            [schema]
+        ).fetchone()[0]
+        if not exists:
+            conn.execute(f"CREATE SCHEMA {schema}")
+            msg = f"Created schema: {schema}"
+            print(msg)
+            if log:
+                log(msg)
     conn.execute(f"DROP TABLE IF EXISTS {table_name}")
     conn.execute(f"CREATE TABLE {table_name} AS SELECT * FROM df")
     count = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
@@ -191,38 +205,62 @@ def format_elapsed(start_time):
 # SQL JOIN cannot handle multi-value fields, so resolution is done
 # in Python using a dict lookup built from customlist_plant_codes.
 
-def resolve_plants(val, plant_map):
+def resolve_id_list(val, id_map):
     """
-    Resolve comma-separated plant IDs to human-readable names.
+    Resolve a comma-separated string of IDs to human-readable names.
+
+    Works for any field that stores one or more IDs as a delimited string
+    (e.g. custbody_items_sourced_from, subsidiary).
 
     Parameters
     ----------
     val : str or None
-        Raw value from custbody_items_sourced_from.
-    plant_map : dict
-        {str(id): plant_name} — build from the plant_codes lookup table:
-            plant_map = dict(zip(plant_df["id"].astype(str), plant_df["plant_name"]))
+        Raw comma-separated ID string (e.g. "3", "3, 4", "1, 5, 7").
+    id_map : dict
+        {str(id): name} — keys must be strings.
 
     Returns
     -------
     str or None
-        Comma-separated plant names, or None if val is null.
+        Comma-separated names, or None if val is null.
         Unknown IDs fall through as-is so missing mappings stay visible.
 
     Example
     -------
+        plant_map = dict(zip(plant_df["id"].astype(str), plant_df["plant_name"]))
         df["sourced_from_name"] = df["custbody_items_sourced_from"].apply(
-            lambda v: resolve_plants(v, plant_map)
+            lambda v: resolve_id_list(v, plant_map)
+        )
+
+        subsidiary_map = {"3": "Screen Innovations", "4": "Shade Innovations"}
+        df["subsidiary_name"] = df["subsidiary"].apply(
+            lambda v: resolve_id_list(v, subsidiary_map)
         )
     """
     if pd.isna(val) or val is None:
         return None
-    ids = [v.strip() for v in str(val).split(",")]
-    return ", ".join(plant_map.get(i, i) for i in ids)
+    ids = [v.strip() for v in str(val).split(",") if v.strip()]
+    return ", ".join(id_map.get(i, i) for i in ids)
 
 
 # Default plant classifications. Pass overrides to resolve_manufacturer_type
 # if the plant list changes rather than editing these module-level defaults.
+#
+# ⚠ EXACT STRING MATCH — SOURCE: customlist_plant_codes (NetSuite)
+# These strings must match the `name` field in customlist_plant_codes exactly,
+# character for character. resolve_manufacturer_type() uses set membership
+# (p in atx_plants), not substring or pattern matching — a plant rename in
+# NetSuite will silently reclassify that plant as Contract Manufacturer.
+#
+# To verify current plant names, run:
+#   SELECT id, name FROM customlist_plant_codes
+#
+# Action required if a plant is renamed, added, or retired in NetSuite:
+#   1. Re-run the query above and compare against the sets below.
+#   2. Update the affected set(s) to match the new name(s) exactly.
+#   3. If a new ATX facility or vendor relationship is added, add the
+#      plant name to the appropriate set — new plants default to CM
+#      and will not self-classify correctly.
 _DEFAULT_ATX_PLANTS    = {"Plant 01 - Screen Innovations"}
 _DEFAULT_VENDOR_PLANTS = {"Plant 00 - Direct From Vendor"}
 
