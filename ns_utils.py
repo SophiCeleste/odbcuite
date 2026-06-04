@@ -177,6 +177,101 @@ def load_duckdb(db_path, table_name, df, log=None):
     return count
 
 
+def load_azure_sql(db_config, table_name, df, log=None):
+    """
+    Drop-and-recreate an Azure SQL table from a DataFrame, return row count.
+
+    Same destructive-replace semantics as load_duckdb — raw schema is a
+    staging layer, not a historical archive.
+
+    Parameters
+    ----------
+    db_config : dict
+        The prod entry from config["databases"]["prod"]. Required keys:
+            server    -- Azure SQL server hostname
+            database  -- database name
+        Optional keys (omit for Azure AD Integrated auth):
+            uid       -- SQL login username
+            pwd       -- SQL login password
+    table_name : str
+        Fully qualified name, e.g. "raw.inventory_position_raw".
+    df : pd.DataFrame
+    log : callable, optional
+        log(msg) from log_setup(). If provided, schema creation is logged.
+
+    Returns
+    -------
+    int
+        Row count of the newly created table.
+
+    Example
+    -------
+        count = load_azure_sql(db_config, config["tables"]["inventory_position"], df, log=log)
+        print(f"Rows loaded: {count}")
+    """
+    from sqlalchemy import create_engine, event, text
+    import urllib
+    import struct
+
+    server   = db_config["server"]
+    database = db_config["database"]
+    uid      = db_config.get("uid")
+    pwd      = db_config.get("pwd")
+
+    base_odbc = (
+        f"DRIVER={{ODBC Driver 18 for SQL Server}};"
+        f"SERVER={server};DATABASE={database};"
+        f"Encrypt=yes;TrustServerCertificate=no;"
+    )
+
+    if uid and pwd:
+        odbc_str = base_odbc + f"UID={uid};PWD={pwd};"
+        engine = create_engine(
+            f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(odbc_str)}"
+        )
+    else:
+        from azure.identity import AzureCliCredential
+        _SQL_COPT_SS_ACCESS_TOKEN = 1256
+        _credential = AzureCliCredential()
+
+        def _get_token():
+            raw = _credential.get_token("https://database.windows.net/.default").token
+            encoded = raw.encode("utf-16-le")
+            return struct.pack(f"<I{len(encoded)}s", len(encoded), encoded)
+
+        engine = create_engine(
+            f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(base_odbc)}"
+        )
+
+        @event.listens_for(engine, "do_connect")
+        def provide_token(dialect, conn_rec, cargs, cparams):
+            cparams["attrs_before"] = {_SQL_COPT_SS_ACCESS_TOKEN: _get_token()}
+
+    schema, tbl = (table_name.split(".", 1) if "." in table_name else (None, table_name))
+
+    if schema:
+        with engine.connect() as conn:
+            exists = conn.execute(
+                text("SELECT COUNT(*) FROM sys.schemas WHERE name = :s"),
+                {"s": schema}
+            ).scalar()
+            if not exists:
+                conn.execute(text(f"CREATE SCHEMA [{schema}]"))
+                conn.commit()
+                msg = f"Created schema: {schema}"
+                print(msg)
+                if log:
+                    log(msg)
+
+    df.to_sql(tbl, engine, schema=schema, if_exists="replace", index=False)
+
+    with engine.connect() as conn:
+        count = conn.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar()
+
+    engine.dispose()
+    return count
+
+
 # ==============================================================
 # TIMING
 # ==============================================================
