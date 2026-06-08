@@ -130,13 +130,14 @@ def sql_to_df(conn, query):
 # DUCKDB
 # ==============================================================
 
-def load_duckdb(db_path, table_name, df, log=None):
+def load_duckdb(db_path, table_name, df, log=None, upsert_keys=None):
     """
-    Drop-and-recreate a DuckDB table from a DataFrame, return row count.
+    Load a DataFrame into a DuckDB table, return total row count.
 
-    Intentionally destructive — the raw schema is a staging layer refreshed
-    on every run, not a historical archive. If you need accumulation, switch
-    to INSERT with deduplication on the id column instead.
+    Default (upsert_keys=None): drop-and-recreate on every run.
+    Pass upsert_keys to switch to append mode — only rows whose key
+    combination is not already present are inserted, so re-running on
+    the same day is safe and history accumulates across runs.
 
     Parameters
     ----------
@@ -145,17 +146,23 @@ def load_duckdb(db_path, table_name, df, log=None):
         Fully qualified name, e.g. "raw.sd_ontime_raw".
     df : pd.DataFrame
     log : callable, optional
-        log(msg) from log_setup(). If provided, schema creation is logged.
+        log(msg) from log_setup(). If provided, schema creation and
+        inserted row counts are logged.
+    upsert_keys : list of str, optional
+        Columns that uniquely identify a row. When supplied, the table is
+        created on the first run and new rows are appended on subsequent
+        runs. Example: ["item_id", "location_name", "snapshot_date"]
 
     Returns
     -------
     int
-        Row count of the newly created table.
+        Total row count of the table after the load.
 
     Example
     -------
         count = load_duckdb(config["db_path"], config["table_name"], df, log=log)
-        print(f"Rows loaded: {count}")
+        count = load_duckdb(db_path, table_name, df, log=log,
+                            upsert_keys=["item_id", "location_name", "snapshot_date"])
     """
     conn = duckdb.connect(str(db_path))
     if "." in table_name:
@@ -170,19 +177,41 @@ def load_duckdb(db_path, table_name, df, log=None):
             print(msg)
             if log:
                 log(msg)
-    conn.execute(f"DROP TABLE IF EXISTS {table_name}")
-    conn.execute(f"CREATE TABLE {table_name} AS SELECT * FROM df")
+
+    if upsert_keys:
+        conn.execute(f"CREATE TABLE IF NOT EXISTS {table_name} AS SELECT * FROM df WHERE 1=0")
+        before = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
+        key_conditions = " AND ".join(f"t.{k} = s.{k}" for k in upsert_keys)
+        conn.execute(f"""
+            INSERT INTO {table_name}
+            SELECT s.* FROM df s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM {table_name} t
+                WHERE {key_conditions}
+            )
+        """)
+        inserted = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0] - before
+        msg = f"Rows inserted into {table_name}: {inserted}"
+        print(msg)
+        if log:
+            log(msg)
+    else:
+        conn.execute(f"DROP TABLE IF EXISTS {table_name}")
+        conn.execute(f"CREATE TABLE {table_name} AS SELECT * FROM df")
+
     count = conn.execute(f"SELECT COUNT(*) FROM {table_name}").fetchone()[0]
     conn.close()
     return count
 
 
-def load_azure_sql(db_config, table_name, df, log=None):
+def load_azure_sql(db_config, table_name, df, log=None, upsert_keys=None):
     """
-    Drop-and-recreate an Azure SQL table from a DataFrame, return row count.
+    Load a DataFrame into an Azure SQL table, return total row count.
 
-    Same destructive-replace semantics as load_duckdb — raw schema is a
-    staging layer, not a historical archive.
+    Default (upsert_keys=None): drop-and-recreate on every run.
+    Pass upsert_keys to switch to append mode — only rows whose key
+    combination is not already present are inserted via a staging table,
+    so re-running on the same day is safe and history accumulates.
 
     Parameters
     ----------
@@ -197,17 +226,23 @@ def load_azure_sql(db_config, table_name, df, log=None):
         Fully qualified name, e.g. "raw.inventory_position_raw".
     df : pd.DataFrame
     log : callable, optional
-        log(msg) from log_setup(). If provided, schema creation is logged.
+        log(msg) from log_setup(). If provided, schema creation and
+        inserted row counts are logged.
+    upsert_keys : list of str, optional
+        Columns that uniquely identify a row. When supplied, the table is
+        created on the first run and new rows are appended on subsequent
+        runs. Example: ["item_id", "location_name", "snapshot_date"]
 
     Returns
     -------
     int
-        Row count of the newly created table.
+        Total row count of the table after the load.
 
     Example
     -------
         count = load_azure_sql(db_config, config["tables"]["inventory_position"], df, log=log)
-        print(f"Rows loaded: {count}")
+        count = load_azure_sql(db_config, table_name, df, log=log,
+                               upsert_keys=["item_id", "location_name", "snapshot_date"])
     """
     from sqlalchemy import create_engine, event, text
     import urllib
@@ -263,7 +298,42 @@ def load_azure_sql(db_config, table_name, df, log=None):
                 if log:
                     log(msg)
 
-    df.to_sql(tbl, engine, schema=schema, if_exists="replace", index=False)
+    schema_prefix = f"[{schema}]." if schema else ""
+
+    if upsert_keys:
+        with engine.connect() as c:
+            table_exists = c.execute(
+                text("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = :s AND table_name = :t"),
+                {"s": schema or "dbo", "t": tbl}
+            ).scalar()
+
+        if not table_exists:
+            df.to_sql(tbl, engine, schema=schema, if_exists="replace", index=False)
+        else:
+            staging = f"_stg_{tbl}"
+            df.to_sql(staging, engine, schema=schema, if_exists="replace", index=False)
+            key_conds = " AND ".join(f"t.[{k}] = s.[{k}]" for k in upsert_keys)
+            with engine.connect() as c:
+                before = c.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar()
+                c.execute(text(f"""
+                    INSERT INTO {schema_prefix}[{tbl}]
+                    SELECT s.*
+                    FROM {schema_prefix}[{staging}] s
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM {schema_prefix}[{tbl}] t
+                        WHERE {key_conds}
+                    )
+                """))
+                c.execute(text(f"DROP TABLE {schema_prefix}[{staging}]"))
+                c.commit()
+            with engine.connect() as c:
+                inserted = c.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar() - before
+            msg = f"Rows inserted into {table_name}: {inserted}"
+            print(msg)
+            if log:
+                log(msg)
+    else:
+        df.to_sql(tbl, engine, schema=schema, if_exists="replace", index=False)
 
     with engine.connect() as conn:
         count = conn.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar()
