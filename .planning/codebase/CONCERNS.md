@@ -8,19 +8,17 @@
 
 ## Security
 
-### Critical: Credentials in Working Tree
+### Credentials in Working Tree
 - `config.json` contains live database credentials stored in the working tree
-- No `.gitignore` entry confirmed to exclude it — risk of accidental commit
-- Credentials are loaded at module import time in `ns_token.py` and `ns_utils.py`
+- `.gitignore` correctly excludes `config.json` — no commit risk ✓
+- ~~Credentials loaded at module import time in `ns_token.py`~~ — **fixed**: now lazy-loaded and cached on first call
 
 ### Plaintext Passwords in ODBC Strings
 - ODBC connection strings include plaintext `PWD=...` values
 - No use of secrets managers, environment variable injection, or credential vaults
 
 ### SQL Injection Surface
-- f-string interpolation is used for table names and column names in dynamically-built SQL queries
-- Example pattern: `f"INSERT INTO {table_name} ..."` — user-supplied or externally-sourced values could be injected
-- No parameterization or allowlist validation observed for identifier names
+- ~~f-string interpolation for table/schema names with no validation~~ — **fixed**: `_check_ident()` allowlist validator added; all four loader functions now reject identifiers containing anything outside `[A-Za-z0-9_.]` before any SQL is built
 
 ---
 
@@ -35,7 +33,7 @@
 - No automated quality gate on commits
 
 ### Duplicate Import
-- `import struct` appears duplicated in at least one module
+- ~~`import struct` duplicated in `ns_utils.py`~~ — **fixed**
 
 ### Stale Artifacts
 - `*.egg-info/` directory and `__pycache__/` present in working tree
