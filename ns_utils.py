@@ -237,7 +237,10 @@ def get_secret(name: str) -> str:
             credential=DefaultAzureCredential(),
         )
 
-    return _secret_client.get_secret(name).value
+    value = _secret_client.get_secret(name).value
+    if value is None:
+        raise ValueError(f"Key Vault secret '{name}' exists but has no value")
+    return value
 
 
 def connect_netsuite(config):
