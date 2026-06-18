@@ -271,7 +271,7 @@ def connect_netsuite(config):
     conn_str = f"DSN={ns_env['dsn']}"
 
     if ns_env["auth"] == "password":
-        conn_str += f";UID={ns_env['uid']};PWD={ns_env['pwd']}"
+        conn_str += f";UID={get_secret(ns_env['secret_uid'])};PWD={get_secret(ns_env['secret_pwd'])}"
     else:
         from ns_token import build_token_password
         conn_str += f";UID=TBA;PWD={build_token_password()}"
@@ -399,8 +399,10 @@ def connect_azure_sql(db_config, log=None):
             server      -- Azure SQL server hostname
             database    -- database name
         Optional keys:
-            uid         -- SQL login username (omit for Azure AD Integrated auth)
-            pwd         -- SQL login password (omit for Azure AD Integrated auth)
+            secret_uid  -- Key Vault secret name for the SQL login username
+                           (omit for Azure AD Integrated auth)
+            secret_pwd  -- Key Vault secret name for the SQL login password
+                           (omit for Azure AD Integrated auth)
             odbc_driver -- ODBC driver name (default: "ODBC Driver 18 for SQL Server")
     log : callable, optional
         log(msg) from log_setup(). Passed to check_odbc_driver for error logging.
@@ -422,8 +424,8 @@ def connect_azure_sql(db_config, log=None):
 
     server      = db_config["server"]
     database    = db_config["database"]
-    uid         = db_config.get("uid")
-    pwd         = db_config.get("pwd")
+    uid         = get_secret(db_config["secret_uid"]) if "secret_uid" in db_config else None
+    pwd         = get_secret(db_config["secret_pwd"]) if "secret_pwd" in db_config else None
     odbc_driver = db_config.get("odbc_driver", "ODBC Driver 18 for SQL Server")
 
     check_odbc_driver(odbc_driver, log=log)

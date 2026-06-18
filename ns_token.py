@@ -12,11 +12,14 @@ No network calls are made — this is pure local HMAC-SHA256 crypto.
 Credentials are loaded once from config.json at import time.
 
 Expected config.json keys under config["netsuite"]["prod"]:
-    account_id      -- NetSuite account ID, e.g. "1234567"
-    consumer_key    -- Consumer key from the NetSuite Integration record
-    consumer_secret -- Consumer secret from the NetSuite Integration record
-    token_id        -- Token ID from the Access Token record
-    token_secret    -- Token secret from the Access Token record
+    account_id              -- NetSuite account ID, e.g. "1234567"
+    secret_consumer_key     -- Key Vault secret name for the Consumer key
+    secret_consumer_secret  -- Key Vault secret name for the Consumer secret
+    secret_token_id         -- Key Vault secret name for the Token ID
+    secret_token_secret     -- Key Vault secret name for the Token secret
+
+The actual TBA token values are resolved at call time via ns_utils.get_secret()
+and cached in-process — never stored in config.json.
 
 Usage:
     from ns_token import build_token_password
@@ -42,13 +45,14 @@ _creds = None
 def _load_creds():
     global _creds
     if _creds is None:
+        from ns_utils import get_secret   # deferred import — avoids circular at module top
         ns = load_config()["netsuite"]["prod"]
         _creds = (
             ns["account_id"],
-            ns["consumer_key"],
-            ns["consumer_secret"],
-            ns["token_id"],
-            ns["token_secret"],
+            get_secret(ns["secret_consumer_key"]),
+            get_secret(ns["secret_consumer_secret"]),
+            get_secret(ns["secret_token_id"]),
+            get_secret(ns["secret_token_secret"]),
         )
     return _creds
 
