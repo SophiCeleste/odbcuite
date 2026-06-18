@@ -102,20 +102,27 @@ def load_config(config_path=None):
         Defaults to config.json in the same directory as ns_utils.py.
 
     Expected config.json keys:
-        env                        -- "dev" or "prod"
-        netsuite.dev.dsn           -- ODBC DSN name for dev (e.g. "NetSuiteDev")
-        netsuite.dev.auth          -- "password"
-        netsuite.dev.uid           -- NetSuite login email (dev)
-        netsuite.dev.pwd           -- NetSuite login password (dev)
-        netsuite.prod.dsn          -- ODBC DSN name for prod (e.g. "NetSuiteProd")
-        netsuite.prod.auth         -- "tba"
-        netsuite.prod.account_id   -- NetSuite account ID
-        netsuite.prod.consumer_key / consumer_secret / token_id / token_secret
+        env                          -- "dev" or "prod"
+        key_vault.url                -- Azure Key Vault URL (non-sensitive)
+        netsuite.dev.dsn             -- ODBC DSN name for dev (e.g. "NetSuiteDev")
+        netsuite.dev.auth            -- "password"
+        netsuite.dev.secret_uid      -- Key Vault secret name for the NetSuite login (dev)
+        netsuite.dev.secret_pwd      -- Key Vault secret name for the NetSuite password (dev)
+        netsuite.prod.dsn            -- ODBC DSN name for prod (e.g. "NetSuiteProd")
+        netsuite.prod.auth           -- "tba"
+        netsuite.prod.account_id     -- NetSuite account ID
+        netsuite.prod.secret_consumer_key / secret_consumer_secret /
+            secret_token_id / secret_token_secret
+                                     -- Key Vault secret names for the TBA token fields
         databases.dev / databases.prod -- target database config
-        tables                     -- fully qualified target table names
-        raw_folder                 -- folder where CSV exports are saved
+        databases.prod.secret_uid / secret_pwd
+                                     -- Key Vault secret names for the Azure SQL login (prod)
+        tables                       -- fully qualified target table names
+        raw_folder                   -- folder where CSV exports are saved
 
-    config.json is never committed — it contains credentials.
+    Credential values are never stored in config.json — only non-sensitive
+    secret-name pointers and the Key Vault URL. Actual secrets are resolved at
+    connection time via get_secret().
     """
     if config_path is None:
         config_path = Path(__file__).parent / "config.json"
