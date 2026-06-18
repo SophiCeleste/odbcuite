@@ -19,6 +19,10 @@ from datetime import datetime
 
 _SAFE_IDENT = re.compile(r"^[A-Za-z0-9_.]+$")
 
+# --- credential resolution cache ---
+_secret_client = None   # SecretClient instance; set on first get_secret() call
+_vault_url = None       # resolved vault URL; cached to avoid re-reading config per call
+
 
 def _check_ident(name, param="table_name"):
     if not _SAFE_IDENT.match(name):
@@ -149,6 +153,84 @@ def check_odbc_driver(odbc_driver, log=None):
         if log:
             log(msg)
         raise RuntimeError(msg)
+
+
+# ==============================================================
+# CREDENTIAL RESOLUTION
+# ==============================================================
+
+def _get_config_vault_url():
+    """
+    Return the Azure Key Vault URL from config.json, or None.
+
+    Reads config["key_vault"]["url"] via load_config(). Any error
+    (missing config.json, missing key_vault key) returns None so the
+    caller can fall back to the environment-variable path.
+
+    Returns
+    -------
+    str or None
+        The vault URL string, or None if not configured.
+    """
+    try:
+        config = load_config()
+        return config.get("key_vault", {}).get("url") or None
+    except Exception:
+        return None
+
+
+def get_secret(name: str) -> str:
+    """
+    Resolve a secret value by name.
+
+    The vault URL is located by checking the AZURE_KEYVAULT_URL environment
+    variable first, then config["key_vault"]["url"]. When a vault URL is
+    configured, the secret is fetched from Azure Key Vault using
+    DefaultAzureCredential and the configured client is cached at module
+    level for the life of the process. When no vault URL is configured, the
+    value is read from the environment variable derived from the secret name
+    (uppercased with hyphens replaced by underscores), which is the local-dev
+    fallback path. A Key Vault authentication or lookup failure is never
+    swallowed — the underlying SDK exception propagates to the caller.
+
+    Parameters
+    ----------
+    name : str
+        Secret name as stored in Key Vault (e.g. "netsuite-uid").
+        The env-var fallback name is derived: "netsuite-uid" -> NETSUITE_UID.
+
+    Returns
+    -------
+    str
+        The secret value.
+
+    Raises
+    ------
+    KeyError
+        If no vault URL is configured and the derived env var is not set.
+    """
+    import os
+    global _secret_client, _vault_url
+
+    # Resolve the vault URL once and cache it at module level. The empty-string
+    # sentinel distinguishes "checked, none configured" from "not yet checked".
+    if _vault_url is None:
+        _vault_url = os.environ.get("AZURE_KEYVAULT_URL") or _get_config_vault_url() or ""
+
+    if not _vault_url:
+        # No vault configured — fall back to the environment variable.
+        env_key = name.upper().replace("-", "_")
+        return os.environ[env_key]  # raises KeyError with env var name if absent
+
+    if _secret_client is None:
+        from azure.keyvault.secrets import SecretClient
+        from azure.identity import DefaultAzureCredential
+        _secret_client = SecretClient(
+            vault_url=_vault_url,
+            credential=DefaultAzureCredential(),
+        )
+
+    return _secret_client.get_secret(name).value
 
 
 def connect_netsuite(config):
