@@ -182,7 +182,7 @@ def _get_config_vault_url():
     try:
         config = load_config()
         return config.get("key_vault", {}).get("url") or None
-    except Exception:
+    except (KeyError, TypeError):
         return None
 
 
