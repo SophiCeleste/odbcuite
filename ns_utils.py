@@ -424,6 +424,10 @@ def connect_azure_sql(db_config, log=None):
 
     server      = db_config["server"]
     database    = db_config["database"]
+
+    if ("secret_uid" in db_config) != ("secret_pwd" in db_config):
+        raise ValueError("db_config must have both secret_uid and secret_pwd, or neither")
+
     uid         = get_secret(db_config["secret_uid"]) if "secret_uid" in db_config else None
     pwd         = get_secret(db_config["secret_pwd"]) if "secret_pwd" in db_config else None
     odbc_driver = db_config.get("odbc_driver", "ODBC Driver 18 for SQL Server")
