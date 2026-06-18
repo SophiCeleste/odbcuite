@@ -274,6 +274,11 @@ def connect_netsuite(config):
     conn_str = f"DSN={ns_env['dsn']}"
 
     if ns_env["auth"] == "password":
+        if "secret_uid" not in ns_env or "secret_pwd" not in ns_env:
+            raise KeyError(
+                f"config['netsuite']['{env}'] with auth='password' must have "
+                "'secret_uid' and 'secret_pwd' keys"
+            )
         conn_str += f";UID={get_secret(ns_env['secret_uid'])};PWD={get_secret(ns_env['secret_pwd'])}"
     else:
         from ns_token import build_token_password
