@@ -10,6 +10,7 @@ Usage in a script:
 
 import json
 import re
+import sys
 import numpy as np
 import pyodbc
 import duckdb
@@ -85,7 +86,17 @@ def cprint(msg, color="white"):
         "white"  — informational output (row counts, elapsed time) [default]
     """
     _codes = {"green": 32, "yellow": 33, "red": 31, "cyan": 36, "white": 37}
-    print(f"\033[{_codes.get(color, 37)}m{msg}\033[0m")
+    try:
+        print(f"\033[{_codes.get(color, 37)}m{msg}\033[0m")
+    except UnicodeEncodeError:
+        # stdout is a legacy codepage (e.g. cp1252 under Task Scheduler or a
+        # redirected file) that cannot encode a character in msg. A cosmetic
+        # character must never abort a caller's write dispatch, so re-emit the
+        # message lossily. Catch ONLY UnicodeEncodeError — a broad except would
+        # swallow security-relevant errors from a shared console (T-06-05-01).
+        target_enc = sys.stdout.encoding or "utf-8"
+        safe_msg = str(msg).encode(target_enc, errors="replace").decode(target_enc)
+        print(f"\033[{_codes.get(color, 37)}m{safe_msg}\033[0m")
 
 
 # ==============================================================
@@ -448,11 +459,25 @@ def connect_azure_sql(db_config, log=None):
         f"Encrypt=yes;TrustServerCertificate=no;"
     )
 
+    def _attach_fast_executemany(engine):
+        # Enable pyodbc fast_executemany on any executemany() call. This turns
+        # df.to_sql(method=None) batches into a single parameterized INSERT
+        # executed once per chunk via the driver's bulk path, avoiding the
+        # multi-row VALUES statement that blows past the 2,100-parameter ODBC
+        # limit (pyodbc 07002). Requires "ODBC Driver 17/18 for SQL Server",
+        # which is the configured driver.
+        @event.listens_for(engine, "before_cursor_execute")
+        def _enable_fast_executemany(conn, cursor, statement, parameters, context, executemany):
+            if executemany:
+                cursor.fast_executemany = True
+        return engine
+
     if uid and pwd:
         odbc_str = base_odbc + f"UID={uid};PWD={pwd};"
-        return create_engine(
+        engine = create_engine(
             f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(odbc_str)}"
         )
+        return _attach_fast_executemany(engine)
 
     from azure.identity import AzureCliCredential
     _SQL_COPT_SS_ACCESS_TOKEN = 1256
@@ -471,10 +496,10 @@ def connect_azure_sql(db_config, log=None):
     def provide_token(dialect, conn_rec, cargs, cparams):
         cparams["attrs_before"] = {_SQL_COPT_SS_ACCESS_TOKEN: _get_token()}
 
-    return engine
+    return _attach_fast_executemany(engine)
 
 
-def load_azure_sql(db_config, table_name, df, log=None, upsert_keys=None):
+def load_azure_sql(db_config, table_name, df, log=None, upsert_keys=None, delete_before_insert=False):
     """
     Load a DataFrame into an Azure SQL table, return total row count.
 
@@ -482,6 +507,11 @@ def load_azure_sql(db_config, table_name, df, log=None, upsert_keys=None):
     Pass upsert_keys to switch to append mode — only rows whose key
     combination is not already present are inserted via a staging table,
     so re-running on the same day is safe and history accumulates.
+
+    Pass delete_before_insert=True (requires upsert_keys) to use delete-then-insert
+    semantics: all rows sharing the same snapshot_date values as the incoming df are
+    deleted before a plain bulk insert, making re-runs idempotent and ensuring the
+    latest extract always wins. Both operations run inside a single transaction.
 
     Parameters
     ----------
@@ -497,6 +527,10 @@ def load_azure_sql(db_config, table_name, df, log=None, upsert_keys=None):
         Columns that uniquely identify a row. When supplied, the table is
         created on the first run and new rows are appended on subsequent
         runs. Example: ["item_id", "location_name", "snapshot_date"]
+    delete_before_insert : bool, optional
+        When True (requires upsert_keys), delete all rows whose snapshot_date
+        matches the incoming df before inserting. Both run in one transaction.
+        Use for scheduled snapshot tables where the latest run should always win.
 
     Returns
     -------
@@ -508,70 +542,113 @@ def load_azure_sql(db_config, table_name, df, log=None, upsert_keys=None):
         count = load_azure_sql(db_config, config["tables"]["inventory_position"], df, log=log)
         count = load_azure_sql(db_config, table_name, df, log=log,
                                upsert_keys=["item_id", "location_name", "snapshot_date"])
+        count = load_azure_sql(db_config, table_name, df, log=log,
+                               upsert_keys=["item_id", "location_name", "snapshot_date"],
+                               delete_before_insert=True)
     """
     _check_ident(table_name)
     from sqlalchemy import text
 
     engine = connect_azure_sql(db_config, log=log)
 
-    schema, tbl = (table_name.split(".", 1) if "." in table_name else (None, table_name))
+    try:
+        schema, tbl = (table_name.split(".", 1) if "." in table_name else (None, table_name))
 
-    if schema:
-        with engine.connect() as conn:
-            exists = conn.execute(
-                text("SELECT COUNT(*) FROM sys.schemas WHERE name = :s"),
-                {"s": schema}
-            ).scalar()
-            if not exists:
-                conn.execute(text(f"CREATE SCHEMA [{schema}]"))
-                conn.commit()
-                msg = f"Created schema: {schema}"
+        if schema:
+            with engine.connect() as conn:
+                exists = conn.execute(
+                    text("SELECT COUNT(*) FROM sys.schemas WHERE name = :s"),
+                    {"s": schema}
+                ).scalar()
+                if not exists:
+                    conn.execute(text(f"CREATE SCHEMA [{schema}]"))
+                    conn.commit()
+                    msg = f"Created schema: {schema}"
+                    print(msg)
+                    if log:
+                        log(msg)
+
+        schema_prefix = f"[{schema}]." if schema else ""
+
+        if upsert_keys and delete_before_insert:
+            with engine.connect() as c:
+                table_exists = c.execute(
+                    text("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = :s AND table_name = :t"),
+                    {"s": schema or "dbo", "t": tbl}
+                ).scalar()
+
+            if not table_exists:
+                with engine.begin() as conn:
+                    df.to_sql(tbl, conn, schema=schema, if_exists="replace", index=False, chunksize=500, method=None)
+            else:
+                # Delete rows whose snapshot_date matches the incoming df, then insert all
+                # rows in a single transaction so there is no window where data is missing.
+                snapshot_dates = df["snapshot_date"].dropna().unique().tolist()
+                placeholders = ", ".join(f":d{i}" for i in range(len(snapshot_dates)))
+                params = {f"d{i}": d for i, d in enumerate(snapshot_dates)}
+                staging = f"_stg_{tbl}"
+                with engine.begin() as conn:
+                    df.to_sql(staging, conn, schema=schema, if_exists="replace", index=False, chunksize=500, method=None)
+                with engine.connect() as c:
+                    before = c.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar()
+                    c.execute(
+                        text(f"DELETE FROM {schema_prefix}[{tbl}] WHERE [snapshot_date] IN ({placeholders})"),
+                        params,
+                    )
+                    c.execute(text(f"INSERT INTO {schema_prefix}[{tbl}] SELECT * FROM {schema_prefix}[{staging}]"))
+                    c.execute(text(f"DROP TABLE {schema_prefix}[{staging}]"))
+                    c.commit()
+                with engine.connect() as c:
+                    inserted = c.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar() - (before - len(df))
+                msg = f"Rows replaced in {table_name}: {len(df)} inserted (snapshot delete-then-insert)"
                 print(msg)
                 if log:
                     log(msg)
 
-    schema_prefix = f"[{schema}]." if schema else ""
+        elif upsert_keys:
+            with engine.connect() as c:
+                table_exists = c.execute(
+                    text("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = :s AND table_name = :t"),
+                    {"s": schema or "dbo", "t": tbl}
+                ).scalar()
 
-    if upsert_keys:
-        with engine.connect() as c:
-            table_exists = c.execute(
-                text("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = :s AND table_name = :t"),
-                {"s": schema or "dbo", "t": tbl}
-            ).scalar()
-
-        if not table_exists:
-            df.to_sql(tbl, engine, schema=schema, if_exists="replace", index=False)
+            if not table_exists:
+                with engine.begin() as conn:
+                    df.to_sql(tbl, conn, schema=schema, if_exists="replace", index=False, chunksize=500, method=None)
+            else:
+                staging = f"_stg_{tbl}"
+                with engine.begin() as conn:
+                    df.to_sql(staging, conn, schema=schema, if_exists="replace", index=False, chunksize=500, method=None)
+                key_conds = " AND ".join(f"t.[{k}] = s.[{k}]" for k in upsert_keys)
+                with engine.connect() as c:
+                    before = c.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar()
+                    c.execute(text(f"""
+                        INSERT INTO {schema_prefix}[{tbl}]
+                        SELECT s.*
+                        FROM {schema_prefix}[{staging}] s
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM {schema_prefix}[{tbl}] t
+                            WHERE {key_conds}
+                        )
+                    """))
+                    c.execute(text(f"DROP TABLE {schema_prefix}[{staging}]"))
+                    c.commit()
+                with engine.connect() as c:
+                    inserted = c.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar() - before
+                msg = f"Rows inserted into {table_name}: {inserted}"
+                print(msg)
+                if log:
+                    log(msg)
         else:
-            staging = f"_stg_{tbl}"
-            df.to_sql(staging, engine, schema=schema, if_exists="replace", index=False)
-            key_conds = " AND ".join(f"t.[{k}] = s.[{k}]" for k in upsert_keys)
-            with engine.connect() as c:
-                before = c.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar()
-                c.execute(text(f"""
-                    INSERT INTO {schema_prefix}[{tbl}]
-                    SELECT s.*
-                    FROM {schema_prefix}[{staging}] s
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM {schema_prefix}[{tbl}] t
-                        WHERE {key_conds}
-                    )
-                """))
-                c.execute(text(f"DROP TABLE {schema_prefix}[{staging}]"))
-                c.commit()
-            with engine.connect() as c:
-                inserted = c.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar() - before
-            msg = f"Rows inserted into {table_name}: {inserted}"
-            print(msg)
-            if log:
-                log(msg)
-    else:
-        df.to_sql(tbl, engine, schema=schema, if_exists="replace", index=False)
+            with engine.begin() as conn:
+                df.to_sql(tbl, conn, schema=schema, if_exists="replace", index=False, chunksize=500, method=None)
 
-    with engine.connect() as conn:
-        count = conn.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar()
+        with engine.connect() as conn:
+            count = conn.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar()
 
-    engine.dispose()
-    return count
+        return count
+    finally:
+        engine.dispose()
 
 
 # ==============================================================
@@ -711,7 +788,7 @@ def scd2_load_duckdb(conn_db, table_name, current_df, identity_keys, tracked_col
 
     to_insert = to_insert.copy()
     to_insert["effective_from"] = today
-    to_insert["effective_to"]   = None
+    to_insert["effective_to"] = pd.Series(pd.NaT, index=to_insert.index, dtype="datetime64[ns]")
     to_insert["is_current"]     = 1
     to_insert["recorded_at"]    = recorded_at
 
@@ -819,16 +896,16 @@ def scd2_load_azure(engine, table_name, current_df, identity_keys, tracked_cols,
 
     to_insert = to_insert.copy()
     to_insert["effective_from"] = today
-    to_insert["effective_to"]   = None
+    to_insert["effective_to"] = pd.Series(pd.NaT, index=to_insert.index, dtype="datetime64[ns]")
     to_insert["is_current"]     = 1
     to_insert["recorded_at"]    = recorded_at
 
     if not table_exists:
-        to_insert.to_sql(tbl, engine, schema=schema, if_exists="replace", index=False)
+        to_insert.to_sql(tbl, engine, schema=schema, if_exists="replace", index=False, chunksize=500, method=None)
     else:
         if len(close_keys) > 0:
             key_joins = " AND ".join(f"t.[{k}] = s.[{k}]" for k in identity_keys)
-            close_keys.to_sql("_close_keys", engine, schema=schema, if_exists="replace", index=False)
+            close_keys.to_sql("_close_keys", engine, schema=schema, if_exists="replace", index=False, chunksize=500, method=None)
             with engine.connect() as c:
                 c.execute(text(f"""
                     UPDATE t
@@ -842,7 +919,7 @@ def scd2_load_azure(engine, table_name, current_df, identity_keys, tracked_cols,
                 c.commit()
 
         if len(to_insert) > 0:
-            to_insert.to_sql(tbl, engine, schema=schema, if_exists="append", index=False)
+            to_insert.to_sql(tbl, engine, schema=schema, if_exists="append", index=False, chunksize=500, method=None)
 
     with engine.connect() as c:
         total         = c.execute(text(f"SELECT COUNT(*) FROM {table_name}")).scalar()

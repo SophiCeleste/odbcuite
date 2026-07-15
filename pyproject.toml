@@ -6,4 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "odbcuite"
 version = "0.1.0"
 requires-python = ">=3.9"
-dependencies = ["pyodbc", "duckdb", "pandas", "numpy", "sqlalchemy", "azure-identity"]
+dependencies = ["pyodbc", "duckdb", "pandas", "numpy", "sqlalchemy", "azure-identity", "azure-keyvault-secrets"]
+
+[tool.setuptools]
+py-modules = ["ns_utils", "ns_token"]
