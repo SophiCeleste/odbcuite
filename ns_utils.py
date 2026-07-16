@@ -479,9 +479,11 @@ def connect_azure_sql(db_config, log=None):
         )
         return _attach_fast_executemany(engine)
 
-    from azure.identity import AzureCliCredential
+    from azure.identity import DefaultAzureCredential
     _SQL_COPT_SS_ACCESS_TOKEN = 1256
-    _credential = AzureCliCredential()
+    # DefaultAzureCredential (not AzureCliCredential) so headless/scheduled runs
+    # use the host's managed identity; falls through to az login on dev machines.
+    _credential = DefaultAzureCredential()
 
     def _get_token():
         raw = _credential.get_token("https://database.windows.net/.default").token
