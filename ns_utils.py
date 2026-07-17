@@ -419,9 +419,13 @@ def connect_azure_sql(db_config, log=None):
             database    -- database name
         Optional keys:
             secret_uid  -- Key Vault secret name for the SQL login username
-                           (omit for Azure AD Integrated auth)
+                           (omit for Azure AD / managed-identity auth)
             secret_pwd  -- Key Vault secret name for the SQL login password
-                           (omit for Azure AD Integrated auth)
+                           (omit for Azure AD / managed-identity auth)
+            managed_identity_client_id
+                        -- Client ID of a user-assigned managed identity to
+                           authenticate with (token auth only). Omit for a
+                           system-assigned identity or az-login dev fallback.
             odbc_driver -- ODBC driver name (default: "ODBC Driver 18 for SQL Server")
     log : callable, optional
         log(msg) from log_setup(). Passed to check_odbc_driver for error logging.
@@ -483,7 +487,12 @@ def connect_azure_sql(db_config, log=None):
     _SQL_COPT_SS_ACCESS_TOKEN = 1256
     # DefaultAzureCredential (not AzureCliCredential) so headless/scheduled runs
     # use the host's managed identity; falls through to az login on dev machines.
-    _credential = DefaultAzureCredential()
+    # managed_identity_client_id selects a user-assigned identity; passing None
+    # (the default) is equivalent to omitting it, so system-assigned and dev
+    # fallback behavior is unchanged.
+    _credential = DefaultAzureCredential(
+        managed_identity_client_id=db_config.get("managed_identity_client_id")
+    )
 
     def _get_token():
         raw = _credential.get_token("https://database.windows.net/.default").token
